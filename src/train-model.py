@@ -1,17 +1,29 @@
-"""Očisti sirove podatke o proizvodima i pripremi train/test CSV fajlove."""
+"""Treniraj i sačuvaj finalni model za klasifikaciju proizvoda."""
 
+import json
 from pathlib import Path
 import re
 
+import joblib
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import LinearSVC
 
 
 # Putanje se računaju u odnosu na projekat, pa skripta radi iz bilo kog direktorijuma.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = PROJECT_ROOT / "IMLP6_TASK_03-products.csv"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
+MODEL_DIR = PROJECT_ROOT / "models"
+MODEL_PATH = MODEL_DIR / "product-category-linear-svc.joblib"
+METRICS_PATH = MODEL_DIR / "product-category-linear-svc-metrics.json"
 RANDOM_SEED = 42
 
 # Ove kolone se čuvaju u train/test fajlovima za kasnije modeliranje.
@@ -28,6 +40,17 @@ FEATURE_COLUMNS = [
     "listing_date_missing",
 ]
 TARGET_COLUMN = "category_label"
+NUMERIC_COLUMNS = [
+    "number_of_views",
+    "merchant_rating",
+    "listing_year",
+    "listing_month",
+    "listing_dayofweek",
+    "number_of_views_missing",
+    "merchant_rating_missing",
+    "listing_date_missing",
+]
+CATEGORICAL_COLUMNS = ["merchant_id"]
 
 
 def normalize_column_name(column_name: str) -> str:
@@ -162,17 +185,120 @@ def save_datasets(
     test_data.to_csv(output_dir / "test.csv", index=False)
 
 
-def main() -> None:
-    """Pokreni kompletan proces pripreme podataka."""
-    data_raw = load_raw_data(DATA_PATH)
-    data_clean = clean_data(data_raw)
-    train_data, test_data = split_data(data_clean)
-    save_datasets(data_clean, train_data, test_data, OUTPUT_DIR)
+def load_prepared_datasets(output_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Učitaj ranije pripremljene train i test skupove."""
+    train_path = output_dir / "train.csv"
+    test_path = output_dir / "test.csv"
+    missing_paths = [path for path in (train_path, test_path) if not path.exists()]
+    if missing_paths:
+        missing = ", ".join(str(path) for path in missing_paths)
+        raise FileNotFoundError(f"Nedostaju pripremljeni skupovi: {missing}")
 
-    print(f"Očišćeni podaci: {len(data_clean):,} redova")
-    print(f"Train skup: {len(train_data):,} redova")
-    print(f"Test skup: {len(test_data):,} redova")
-    print(f"Izlazni fajlovi: {OUTPUT_DIR.resolve()}")
+    train_data = pd.read_csv(train_path)
+    test_data = pd.read_csv(test_path)
+    required_columns = set(FEATURE_COLUMNS + [TARGET_COLUMN])
+    for path, dataset in ((train_path, train_data), (test_path, test_data)):
+        missing_columns = required_columns.difference(dataset.columns)
+        if missing_columns:
+            raise ValueError(
+                f"{path} nema obavezne kolone: {sorted(missing_columns)}"
+            )
+        dataset["merchant_id"] = pd.to_numeric(
+            dataset["merchant_id"], errors="raise"
+        )
+
+    return train_data, test_data
+
+
+def build_model() -> Pipeline:
+    """Napravi najbolje rešenje iz notebook eksperimenata."""
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "title_tfidf",
+                TfidfVectorizer(
+                    ngram_range=(1, 2),
+                    min_df=2,
+                    max_df=0.98,
+                    max_features=30_000,
+                    sublinear_tf=True,
+                    dtype=np.float32,
+                ),
+                "product_title_clean",
+            ),
+            ("numeric", numeric_pipeline, NUMERIC_COLUMNS),
+            (
+                "merchant",
+                OneHotEncoder(handle_unknown="ignore", dtype=np.float32),
+                CATEGORICAL_COLUMNS,
+            ),
+        ],
+        remainder="drop",
+    )
+    return Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("classifier", LinearSVC(C=1.0, tol=1e-3)),
+        ]
+    )
+
+
+def evaluate_model(
+    model: Pipeline, train_data: pd.DataFrame, test_data: pd.DataFrame
+) -> dict[str, object]:
+    """Treniraj na train skupu i izmeri rezultat na sačuvanom test skupu."""
+    model.fit(train_data[FEATURE_COLUMNS], train_data[TARGET_COLUMN])
+    predictions = model.predict(test_data[FEATURE_COLUMNS])
+    metrics = {
+        "model": "LinearSVC",
+        "accuracy": float(accuracy_score(test_data[TARGET_COLUMN], predictions)),
+        "macro_f1": float(
+            f1_score(test_data[TARGET_COLUMN], predictions, average="macro")
+        ),
+        "train_rows": len(train_data),
+        "test_rows": len(test_data),
+        "categories": int(train_data[TARGET_COLUMN].nunique()),
+    }
+    print(classification_report(test_data[TARGET_COLUMN], predictions, zero_division=0))
+    return metrics
+
+
+def save_final_model(
+    model: Pipeline,
+    all_data: pd.DataFrame,
+    metrics: dict[str, object],
+    model_path: Path,
+    metrics_path: Path,
+) -> None:
+    """Ponovo treniraj na svim podacima i sačuvaj model i evaluacione metrike."""
+    model.fit(all_data[FEATURE_COLUMNS], all_data[TARGET_COLUMN])
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, model_path)
+    metrics_path.write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def main() -> None:
+    """Evaluiraj najbolje rešenje, treniraj ga na svim podacima i sačuvaj."""
+    train_data, test_data = load_prepared_datasets(OUTPUT_DIR)
+    evaluation_model = build_model()
+    metrics = evaluate_model(evaluation_model, train_data, test_data)
+
+    final_model = build_model()
+    all_data = pd.concat([train_data, test_data], ignore_index=True)
+    save_final_model(final_model, all_data, metrics, MODEL_PATH, METRICS_PATH)
+
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"Macro F1: {metrics['macro_f1']:.4f}")
+    print(f"Finalni model: {MODEL_PATH.resolve()}")
+    print(f"Metrike: {METRICS_PATH.resolve()}")
 
 
 if __name__ == "__main__":

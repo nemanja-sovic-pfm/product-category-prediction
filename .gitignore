@@ -1,0 +1,3 @@
+# Generated trained-model artifacts
+models/*.joblib
+models/*.pkl

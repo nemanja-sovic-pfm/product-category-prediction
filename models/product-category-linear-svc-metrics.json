@@ -1,0 +1,8 @@
+{
+  "model": "LinearSVC",
+  "accuracy": 0.9615509409474368,
+  "macro_f1": 0.9642353302441693,
+  "train_rows": 24652,
+  "test_rows": 6164,
+  "categories": 10
+}
